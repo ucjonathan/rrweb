@@ -1,6 +1,8 @@
+/// <reference types="node" />
 import { serializedNodeWithId, idNodeMap, INode, MaskInputOptions, SlimDOMOptions } from 'rrweb-snapshot';
 import { PackFn, UnpackFn } from './packer/base';
 import { FontFaceDescriptors } from 'css-font-loading-module';
+import { IframeManager } from './record/iframe-manager';
 export declare enum EventType {
     DomContentLoaded = 0,
     Load = 1,
@@ -80,7 +82,7 @@ export declare type scrollData = {
 } & scrollPosition;
 export declare type viewportResizeData = {
     source: IncrementalSource.ViewportResize;
-} & viewportResizeDimention;
+} & viewportResizeDimension;
 export declare type inputData = {
     source: IncrementalSource.Input;
     id: number;
@@ -109,6 +111,7 @@ export declare type eventWithTime = event & {
 export declare type blockClass = string | RegExp;
 export declare type SamplingStrategy = Partial<{
     mousemove: boolean | number;
+    mousemoveCallback: number;
     mouseInteraction: boolean | Record<string, boolean | undefined>;
     scroll: number;
     input: 'all' | 'last';
@@ -156,6 +159,8 @@ export declare type observerParam = {
     recordCanvas: boolean;
     collectFonts: boolean;
     slimDOMOptions: SlimDOMOptions;
+    doc: Document;
+    iframeManager: IframeManager;
 };
 export declare type hooksParam = {
     mutation?: mutationCallBack;
@@ -303,11 +308,11 @@ export declare type LogParam = {
 };
 export declare type fontCallback = (p: fontParam) => void;
 export declare type logCallback = (p: LogParam) => void;
-export declare type viewportResizeDimention = {
+export declare type viewportResizeDimension = {
     width: number;
     height: number;
 };
-export declare type viewportResizeCallback = (d: viewportResizeDimention) => void;
+export declare type viewportResizeCallback = (d: viewportResizeDimension) => void;
 export declare type inputValue = {
     text: string;
     isChecked: boolean;
@@ -324,6 +329,12 @@ export declare type mediaInteractionParam = {
     id: number;
 };
 export declare type mediaInteractionCallback = (p: mediaInteractionParam) => void;
+export declare type DocumentDimension = {
+    x: number;
+    y: number;
+    relativeScale: number;
+    absoluteScale: number;
+};
 export declare type Mirror = {
     map: idNodeMap;
     getId: (n: INode) => number;

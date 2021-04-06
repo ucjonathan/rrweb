@@ -11,7 +11,7 @@ import {
   MouseInteractions,
   playerConfig,
   playerMetaData,
-  viewportResizeDimention,
+  viewportResizeDimension,
   missingNodeMap,
   addedNodeMutation,
   missingNode,
@@ -37,6 +37,10 @@ import {
   TreeIndex,
   queueToResolveTrees,
   iterateResolveTree,
+  AppendedIframe,
+  isIframeINode,
+  getBaseDimension,
+  hasShadowRoot,
 } from '../utils';
 import getInjectStyleRules from './styles/inject-style';
 import './styles/style.css';
@@ -49,6 +53,11 @@ const SKIP_TIME_INTERVAL = 5 * 1000;
 const mitt = (mittProxy as any).default || mittProxy;
 
 const REPLAY_CONSOLE_PREFIX = '[replayer]';
+const ORIGINAL_ATTRIBUTE_NAME = '__rrweb_original__';
+
+type PatchedConsoleLog = {
+  [ORIGINAL_ATTRIBUTE_NAME]: typeof console.log;
+};
 
 const defaultMouseTailConfig = {
   duration: 500,
@@ -111,6 +120,8 @@ export class Replayer {
 
   private imageMap: Map<eventWithTime, HTMLImageElement> = new Map();
 
+  private newDocumentQueue: addedNodeMutation[] = [];
+
   constructor(
     events: Array<eventWithTime | string>,
     config?: Partial<playerConfig>,
@@ -120,6 +131,7 @@ export class Replayer {
     }
     const defaultConfig: playerConfig = {
       speed: 1,
+      maxSpeed: 360,
       root: document.body,
       loadTimeout: 0,
       skipInactive: false,
@@ -135,8 +147,9 @@ export class Replayer {
       logConfig: defaultLogConfig,
     };
     this.config = Object.assign({}, defaultConfig, config);
-    if (!this.config.logConfig.replayLogger)
+    if (!this.config.logConfig.replayLogger) {
       this.config.logConfig.replayLogger = this.getConsoleLogger();
+    }
 
     this.handleResize = this.handleResize.bind(this);
     this.getCastFn = this.getCastFn.bind(this);
@@ -233,8 +246,15 @@ export class Replayer {
     }
     if (firstFullsnapshot) {
       setTimeout(() => {
+        // when something has been played, there is no need to rebuild poster
+        if (this.timer.timeOffset > 0) {
+          return;
+        }
         this.rebuildFullSnapshot(
           firstFullsnapshot as fullSnapshotEvent & { timestamp: number },
+        );
+        this.iframe.contentWindow!.scrollTo(
+          (firstFullsnapshot as fullSnapshotEvent).data.initialOffset,
         );
       }, 1);
     }
@@ -403,7 +423,7 @@ export class Replayer {
     }
   }
 
-  private handleResize(dimension: viewportResizeDimention) {
+  private handleResize(dimension: viewportResizeDimension) {
     this.iframe.style.display = 'inherit';
     for (const el of [this.mouseTail, this.iframe]) {
       if (!el) {
@@ -474,7 +494,10 @@ export class Replayer {
               const skipTime =
                 this.nextUserInteractionEvent.delay! - event.delay!;
               const payload = {
-                speed: Math.min(Math.round(skipTime / SKIP_TIME_INTERVAL), 360),
+                speed: Math.min(
+                  Math.round(skipTime / SKIP_TIME_INTERVAL),
+                  this.config.maxSpeed,
+                ),
               };
               this.speedService.send({ type: 'FAST_FORWARD', payload });
               this.emitter.emit(ReplayerEvents.SkipStart, payload);
@@ -531,11 +554,44 @@ export class Replayer {
       );
     }
     this.legacy_missingNodeRetryMap = {};
+    const collected: AppendedIframe[] = [];
     mirror.map = rebuild(event.data.node, {
       doc: this.iframe.contentDocument,
+      afterAppend: (builtNode) => {
+        this.collectIframeAndAttachDocument(collected, builtNode);
+      },
     })[1];
-    const styleEl = document.createElement('style');
+    for (const { mutationInQueue, builtNode } of collected) {
+      this.attachDocumentToIframe(mutationInQueue, builtNode);
+      this.newDocumentQueue = this.newDocumentQueue.filter(
+        (m) => m !== mutationInQueue,
+      );
+      if (builtNode.contentDocument) {
+        const { documentElement, head } = builtNode.contentDocument;
+        this.insertStyleRules(documentElement, head);
+      }
+    }
     const { documentElement, head } = this.iframe.contentDocument;
+    this.insertStyleRules(documentElement, head);
+    if (!this.service.state.matches('playing')) {
+      this.iframe.contentDocument
+        .getElementsByTagName('html')[0]
+        .classList.add('rrweb-paused');
+    }
+    this.emitter.emit(ReplayerEvents.FullsnapshotRebuilded, event);
+    if (!isSync) {
+      this.waitForStylesheetLoad();
+    }
+    if (this.config.UNSAFE_replayCanvas) {
+      this.preloadAllImages();
+    }
+  }
+
+  private insertStyleRules(
+    documentElement: HTMLElement,
+    head: HTMLHeadElement,
+  ) {
+    const styleEl = document.createElement('style');
     documentElement!.insertBefore(styleEl, head);
     const injectStylesRules = getInjectStyleRules(
       this.config.blockClass,
@@ -545,20 +601,48 @@ export class Replayer {
         'html.rrweb-paused * { animation-play-state: paused !important; }',
       );
     }
-    if (!this.service.state.matches('playing')) {
-      this.iframe.contentDocument
-        .getElementsByTagName('html')[0]
-        .classList.add('rrweb-paused');
-    }
     for (let idx = 0; idx < injectStylesRules.length; idx++) {
       (styleEl.sheet! as CSSStyleSheet).insertRule(injectStylesRules[idx], idx);
     }
-    this.emitter.emit(ReplayerEvents.FullsnapshotRebuilded, event);
-    if (!isSync) {
-      this.waitForStylesheetLoad();
+  }
+
+  private attachDocumentToIframe(
+    mutation: addedNodeMutation,
+    iframeEl: HTMLIFrameElement,
+  ) {
+    const collected: AppendedIframe[] = [];
+    buildNodeWithSN(mutation.node, {
+      doc: iframeEl.contentDocument!,
+      map: mirror.map,
+      hackCss: true,
+      skipChild: false,
+      afterAppend: (builtNode) => {
+        this.collectIframeAndAttachDocument(collected, builtNode);
+      },
+    });
+    for (const { mutationInQueue, builtNode } of collected) {
+      this.attachDocumentToIframe(mutationInQueue, builtNode);
+      this.newDocumentQueue = this.newDocumentQueue.filter(
+        (m) => m !== mutationInQueue,
+      );
+      if (builtNode.contentDocument) {
+        const { documentElement, head } = builtNode.contentDocument;
+        this.insertStyleRules(documentElement, head);
+      }
     }
-    if (this.config.UNSAFE_replayCanvas) {
-      this.preloadAllImages();
+  }
+
+  private collectIframeAndAttachDocument(
+    collected: AppendedIframe[],
+    builtNode: INode,
+  ) {
+    if (isIframeINode(builtNode)) {
+      const mutationInQueue = this.newDocumentQueue.find(
+        (m) => m.parentId === builtNode.__sn.id,
+      );
+      if (mutationInQueue) {
+        collected.push({ mutationInQueue, builtNode });
+      }
     }
   }
 
@@ -946,8 +1030,9 @@ export class Replayer {
         try {
           const logData = e.data as logData;
           const replayLogger = this.config.logConfig.replayLogger!;
-          if (typeof replayLogger[logData.level] === 'function')
+          if (typeof replayLogger[logData.level] === 'function') {
             replayLogger[logData.level]!(logData);
+          }
         } catch (error) {
           if (this.config.showWarning) {
             console.warn(error);
@@ -964,14 +1049,18 @@ export class Replayer {
       if (!target) {
         return this.warnNodeNotFound(d, mutation.id);
       }
-      const parent = mirror.getNode(mutation.parentId);
+      let parent: INode | null | ShadowRoot = mirror.getNode(mutation.parentId);
       if (!parent) {
         return this.warnNodeNotFound(d, mutation.parentId);
+      }
+      if (mutation.isShadow && hasShadowRoot(parent)) {
+        parent = parent.shadowRoot;
       }
       // target may be removed with its parents before
       mirror.removeNodeFromMap(target);
       if (parent) {
-        const realParent = this.fragmentParentMap.get(parent);
+        const realParent =
+          '__sn' in parent ? this.fragmentParentMap.get(parent) : undefined;
         if (realParent && realParent.contains(target)) {
           realParent.removeChild(target);
         } else if (this.fragmentParentMap.has(target)) {
@@ -1016,8 +1105,12 @@ export class Replayer {
       if (!this.iframe.contentDocument) {
         return console.warn('Looks like your replayer has been destroyed.');
       }
-      let parent = mirror.getNode(mutation.parentId);
+      let parent: INode | null | ShadowRoot = mirror.getNode(mutation.parentId);
       if (!parent) {
+        if (mutation.node.type === NodeType.Document) {
+          // is newly added document, maybe the document node of an iframe
+          return this.newDocumentQueue.push(mutation);
+        }
         return queue.push(mutation);
       }
 
@@ -1030,7 +1123,8 @@ export class Replayer {
         parentInDocument = this.iframe.contentDocument.body.contains(parent);
       }
 
-      if (useVirtualParent && parentInDocument) {
+      // if parent element is an iframe, iframe document can't be appended to virtual parent
+      if (useVirtualParent && parentInDocument && !isIframeINode(parent)) {
         const virtualParent = (document.createDocumentFragment() as unknown) as INode;
         mirror.map[mutation.parentId] = virtualParent;
         this.fragmentParentMap.set(virtualParent, parent);
@@ -1042,6 +1136,10 @@ export class Replayer {
           virtualParent.appendChild(parent.firstChild);
         }
         parent = virtualParent;
+      }
+
+      if (mutation.node.isShadow && hasShadowRoot(parent)) {
+        parent = parent.shadowRoot;
       }
 
       let previous: Node | null = null;
@@ -1056,12 +1154,23 @@ export class Replayer {
         return queue.push(mutation);
       }
 
+      if (mutation.node.rootId && !mirror.getNode(mutation.node.rootId)) {
+        return;
+      }
+
+      const targetDoc = mutation.node.rootId
+        ? mirror.getNode(mutation.node.rootId)
+        : this.iframe.contentDocument;
+      if (isIframeINode(parent)) {
+        this.attachDocumentToIframe(mutation, parent);
+        return;
+      }
       const target = buildNodeWithSN(mutation.node, {
-        doc: this.iframe.contentDocument,
+        doc: targetDoc as Document,
         map: mirror.map,
         skipChild: true,
         hackCss: true,
-      }) as Node;
+      }) as INode;
 
       // legacy data, we should not have -1 siblings any more
       if (mutation.previousId === -1 || mutation.nextId === -1) {
@@ -1081,7 +1190,32 @@ export class Replayer {
           ? parent.insertBefore(target, next)
           : parent.insertBefore(target, null);
       } else {
+        /**
+         * Sometimes the document changes and the MutationObserver is disconnected, so the removal of child elements can't be detected and recorded. After the change of document, we may get another mutation which adds a new html element, while the old html element still exists in the dom, and we need to remove the old html element first to avoid collision.
+         */
+        if (parent === targetDoc) {
+          while (targetDoc.firstChild) {
+            targetDoc.removeChild(targetDoc.firstChild);
+          }
+        }
+
         parent.appendChild(target);
+      }
+
+      if (isIframeINode(target)) {
+        const mutationInQueue = this.newDocumentQueue.find(
+          (m) => m.parentId === target.__sn.id,
+        );
+        if (mutationInQueue) {
+          this.attachDocumentToIframe(mutationInQueue, target);
+          this.newDocumentQueue = this.newDocumentQueue.filter(
+            (m) => m !== mutationInQueue,
+          );
+        }
+        if (target.contentDocument) {
+          const { documentElement, head } = target.contentDocument;
+          this.insertStyleRules(documentElement, head);
+        }
       }
 
       if (mutation.previousId || mutation.nextId) {
@@ -1214,7 +1348,9 @@ export class Replayer {
    * @param data the log data
    */
   private formatMessage(data: logData): string {
-    if (data.trace.length === 0) return '';
+    if (data.trace.length === 0) {
+      return '';
+    }
     const stackPrefix = '\n\tat ';
     let result = stackPrefix;
     result += data.trace.join(stackPrefix);
@@ -1225,29 +1361,38 @@ export class Replayer {
    * generate a console log replayer which implement the interface ReplayLogger
    */
   private getConsoleLogger(): ReplayLogger {
-    const rrwebOriginal = '__rrweb_original__';
     const replayLogger: ReplayLogger = {};
-    for (const level of this.config.logConfig.level!)
-      if (level === 'trace')
+    for (const level of this.config.logConfig.level!) {
+      if (level === 'trace') {
         replayLogger[level] = (data: logData) => {
-          const logger = (console.log as any)[rrwebOriginal]
-            ? (console.log as any)[rrwebOriginal]
+          const logger = ((console.log as unknown) as PatchedConsoleLog)[
+            ORIGINAL_ATTRIBUTE_NAME
+          ]
+            ? ((console.log as unknown) as PatchedConsoleLog)[
+                ORIGINAL_ATTRIBUTE_NAME
+              ]
             : console.log;
           logger(
             ...data.payload.map((s) => JSON.parse(s)),
             this.formatMessage(data),
           );
         };
-      else
+      } else {
         replayLogger[level] = (data: logData) => {
-          const logger = (console[level] as any)[rrwebOriginal]
-            ? (console[level] as any)[rrwebOriginal]
+          const logger = ((console[level] as unknown) as PatchedConsoleLog)[
+            ORIGINAL_ATTRIBUTE_NAME
+          ]
+            ? ((console[level] as unknown) as PatchedConsoleLog)[
+                ORIGINAL_ATTRIBUTE_NAME
+              ]
             : console[level];
           logger(
             ...data.payload.map((s) => JSON.parse(s)),
             this.formatMessage(data),
           );
         };
+      }
+    }
     return replayLogger;
   }
 
@@ -1281,14 +1426,18 @@ export class Replayer {
   }
 
   private moveAndHover(d: incrementalData, x: number, y: number, id: number) {
-    this.mouse.style.left = `${x}px`;
-    this.mouse.style.top = `${y}px`;
-    this.drawMouseTail({ x, y });
-
     const target = mirror.getNode(id);
     if (!target) {
       return this.debugNodeNotFound(d, id);
     }
+
+    const base = getBaseDimension(target, this.iframe);
+    const _x = x * base.absoluteScale + base.x;
+    const _y = y * base.absoluteScale + base.y;
+
+    this.mouse.style.left = `${_x}px`;
+    this.mouse.style.top = `${_y}px`;
+    this.drawMouseTail({ x: _x, y: _y });
     this.hoverElements((target as Node) as Element);
   }
 
@@ -1325,7 +1474,7 @@ export class Replayer {
     setTimeout(() => {
       this.tailPositions = this.tailPositions.filter((p) => p !== position);
       draw();
-    }, duration);
+    }, duration / this.speedService.state.context.timer.speed);
   }
 
   private hoverElements(el: Element) {
