@@ -120,6 +120,9 @@ export class Replayer {
 
   private imageMap: Map<eventWithTime, HTMLImageElement> = new Map();
 
+  /** The first time the player is playing. */
+  private firstPlayedEvent: eventWithTime | null = null;
+
   private newDocumentQueue: addedNodeMutation[] = [];
 
   constructor(
@@ -163,23 +166,9 @@ export class Replayer {
     this.emitter.on(ReplayerEvents.Flush, () => {
       const { scrollMap, inputMap } = this.treeIndex.flush();
 
-      for (const [frag, parent] of this.fragmentParentMap.entries()) {
-        mirror.map[parent.__sn.id] = parent;
-        /**
-         * If we have already set value attribute on textarea,
-         * then we could not apply text content as default value any more.
-         */
-        if (
-          parent.__sn.type === NodeType.Element &&
-          parent.__sn.tagName === 'textarea' &&
-          frag.textContent
-        ) {
-          ((parent as unknown) as HTMLTextAreaElement).value = frag.textContent;
-        }
-        parent.appendChild(frag);
-        // restore state of elements after they are mounted
-        this.restoreState(parent);
-      }
+      this.fragmentParentMap.forEach((parent, frag) =>
+        this.restoreRealParent(frag, parent),
+      );
       this.fragmentParentMap.clear();
       this.elementStateMap.clear();
 
@@ -190,16 +179,22 @@ export class Replayer {
         this.applyInput(d);
       }
     });
+    this.emitter.on(ReplayerEvents.PlayBack, () => {
+      this.firstPlayedEvent = null;
+      mirror.reset();
+    });
 
     const timer = new Timer([], config?.speed || defaultConfig.speed);
     this.service = createPlayerService(
       {
-        events: events.map((e) => {
-          if (config && config.unpackFn) {
-            return config.unpackFn(e as string);
-          }
-          return e as eventWithTime;
-        }),
+        events: events
+          .map((e) => {
+            if (config && config.unpackFn) {
+              return config.unpackFn(e as string);
+            }
+            return e as eventWithTime;
+          })
+          .sort((a1, a2) => a1.timestamp - a2.timestamp),
         timer,
         timeOffset: 0,
         baselineTime: 0,
@@ -247,9 +242,10 @@ export class Replayer {
     if (firstFullsnapshot) {
       setTimeout(() => {
         // when something has been played, there is no need to rebuild poster
-        if (this.timer.timeOffset > 0) {
+        if (this.firstPlayedEvent) {
           return;
         }
+        this.firstPlayedEvent = firstFullsnapshot;
         this.rebuildFullSnapshot(
           firstFullsnapshot as fullSnapshotEvent & { timestamp: number },
         );
@@ -459,6 +455,10 @@ export class Replayer {
         break;
       case EventType.FullSnapshot:
         castFn = () => {
+          // Don't build a full snapshot during the first play through since we've already built it when the player was mounted.
+          if (this.firstPlayedEvent && this.firstPlayedEvent === event) {
+            return;
+          }
           this.rebuildFullSnapshot(event, isSync);
           this.iframe.contentWindow!.scrollTo(event.data.initialOffset);
         };
@@ -512,6 +512,8 @@ export class Replayer {
         castFn();
       }
       this.service.send({ type: 'CAST_EVENT', payload: { event } });
+
+      // events are kept sorted by timestamp, check if this is the last event
       if (
         event ===
         this.service.state.context.events[
@@ -611,6 +613,20 @@ export class Replayer {
     iframeEl: HTMLIFrameElement,
   ) {
     const collected: AppendedIframe[] = [];
+    // If iframeEl is detached from dom, iframeEl.contentDocument is null.
+    if (!iframeEl.contentDocument) {
+      let parent = iframeEl.parentNode;
+      while (parent) {
+        // The parent of iframeEl is virtual parent and we need to mount it on the dom.
+        if (this.fragmentParentMap.has((parent as unknown) as INode)) {
+          const frag = (parent as unknown) as INode;
+          const realParent = this.fragmentParentMap.get(frag)!;
+          this.restoreRealParent(frag, realParent);
+          break;
+        }
+        parent = parent.parentNode;
+      }
+    }
     buildNodeWithSN(mutation.node, {
       doc: iframeEl.contentDocument!,
       map: mirror.map,
@@ -1123,8 +1139,19 @@ export class Replayer {
         parentInDocument = this.iframe.contentDocument.body.contains(parent);
       }
 
-      // if parent element is an iframe, iframe document can't be appended to virtual parent
-      if (useVirtualParent && parentInDocument && !isIframeINode(parent)) {
+      const hasIframeChild =
+        ((parent as unknown) as HTMLElement).getElementsByTagName?.('iframe')
+          .length > 0;
+      /**
+       * Why !isIframeINode(parent)? If parent element is an iframe, iframe document can't be appended to virtual parent.
+       * Why !hasIframeChild? If we move iframe elements from dom to fragment document, we will lose the contentDocument of iframe. So we need to disable the virtual dom optimization if a parent node contains iframe elements.
+       */
+      if (
+        useVirtualParent &&
+        parentInDocument &&
+        !isIframeINode(parent) &&
+        !hasIframeChild
+      ) {
         const virtualParent = (document.createDocumentFragment() as unknown) as INode;
         mirror.map[mutation.parentId] = virtualParent;
         this.fragmentParentMap.set(virtualParent, parent);
@@ -1511,6 +1538,29 @@ export class Replayer {
     this.emitter.emit(ReplayerEvents.SkipEnd, {
       speed: this.speedService.state.context.normalSpeed,
     });
+  }
+
+  /**
+   * Replace the virtual parent with the real parent.
+   * @param frag fragment document, the virtual parent
+   * @param parent real parent element
+   */
+  private restoreRealParent(frag: INode, parent: INode) {
+    mirror.map[parent.__sn.id] = parent;
+    /**
+     * If we have already set value attribute on textarea,
+     * then we could not apply text content as default value any more.
+     */
+    if (
+      parent.__sn.type === NodeType.Element &&
+      parent.__sn.tagName === 'textarea' &&
+      frag.textContent
+    ) {
+      ((parent as unknown) as HTMLTextAreaElement).value = frag.textContent;
+    }
+    parent.appendChild(frag);
+    // restore state of elements after they are mounted
+    this.restoreState(parent);
   }
 
   /**

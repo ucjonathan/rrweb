@@ -7,7 +7,7 @@
 
 # rrweb
 
-**[招聘：和我们一起，做难的事情!](https://mp.weixin.qq.com/s/VhFwemIzaXec-hI3zyltfg)**
+**[🚀 Storyteller, 基于 rrweb 开发的无代码交互式教程编辑器](https://storyteller.webzard.io/?utm_source=rrweb&utm_medium=github)**
 
 **[rrweb 社区新的征程](http://www.myriptide.com/rrweb-community-cn/)**
 

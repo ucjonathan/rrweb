@@ -82,6 +82,7 @@ export enum IncrementalSource {
   CanvasMutation,
   Font,
   Log,
+  Drag,
 }
 
 export type mutationData = {
@@ -89,7 +90,10 @@ export type mutationData = {
 } & mutationCallbackParam;
 
 export type mousemoveData = {
-  source: IncrementalSource.MouseMove | IncrementalSource.TouchMove;
+  source:
+    | IncrementalSource.MouseMove
+    | IncrementalSource.TouchMove
+    | IncrementalSource.Drag;
   positions: mousePosition[];
 };
 
@@ -159,6 +163,8 @@ export type eventWithTime = event & {
 
 export type blockClass = string | RegExp;
 
+export type maskTextClass = string | RegExp;
+
 export type SamplingStrategy = Partial<{
   /**
    * false means not to record mouse/touch move events
@@ -192,9 +198,12 @@ export type recordOptions<T> = {
   blockClass?: blockClass;
   blockSelector?: string;
   ignoreClass?: string;
+  maskTextClass?: maskTextClass;
+  maskTextSelector?: string;
   maskAllInputs?: boolean;
   maskInputOptions?: MaskInputOptions;
   maskInputFn?: MaskInputFn;
+  maskTextFn?: MaskTextFn;
   slimDOMOptions?: SlimDOMOptions | 'all' | true;
   inlineStylesheet?: boolean;
   hooks?: hooksParam;
@@ -218,8 +227,11 @@ export type observerParam = {
   blockClass: blockClass;
   blockSelector: string | null;
   ignoreClass: string;
+  maskTextClass: maskTextClass;
+  maskTextSelector: string | null;
   maskInputOptions: MaskInputOptions;
   maskInputFn?: MaskInputFn;
+  maskTextFn?: MaskTextFn;
   inlineStylesheet: boolean;
   styleSheetRuleCb: styleSheetRuleCallback;
   canvasMutationCb: canvasMutationCallback;
@@ -307,7 +319,10 @@ export type mutationCallBack = (m: mutationCallbackParam) => void;
 
 export type mousemoveCallBack = (
   p: mousePosition[],
-  source: IncrementalSource.MouseMove | IncrementalSource.TouchMove,
+  source:
+    | IncrementalSource.MouseMove
+    | IncrementalSource.TouchMove
+    | IncrementalSource.Drag,
 ) => void;
 
 export type mousePosition = {
@@ -482,6 +497,7 @@ export type Mirror = {
   getNode: (id: number) => INode | null;
   removeNodeFromMap: (n: INode) => void;
   has: (id: number) => boolean;
+  reset: () => void;
 };
 
 export type throttleOptions = {
@@ -570,9 +586,12 @@ export enum ReplayerEvents {
   CustomEvent = 'custom-event',
   Flush = 'flush',
   StateChange = 'state-change',
+  PlayBack = 'play-back',
 }
 
 export type MaskInputFn = (text: string) => string;
+
+export type MaskTextFn = (text: string) => string;
 
 // store the state that would be changed during the process(unmount from dom and mount again)
 export type ElementState = {
